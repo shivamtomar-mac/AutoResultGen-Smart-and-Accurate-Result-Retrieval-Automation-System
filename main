@@ -1,0 +1,165 @@
+import time
+import base64
+import os
+import google.generativeai as genai
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import pandas as pd
+from fpdf import FPDF
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Configure Gemini API
+api_key = "YOUR_GEMINI_API_KEY"  # Store safely or use os.getenv("GEMINI_API_KEY")
+genai.configure(api_key=api_key)
+
+# Function to solve captcha using Gemini API
+def solve_captcha(image_path: str) -> str:
+    """Extracts text from a CAPTCHA image using Gemini API and returns it without spaces."""
+    with open(image_path, "rb") as img_file:
+        image_data = img_file.read()
+   
+    encoded_image = base64.b64encode(image_data).decode("utf-8")
+
+    model = genai.GenerativeModel(model_name="gemini-1.5-pro")
+    prompt = "Extract the text from this CAPTCHA image."
+
+    response = model.generate_content([{'mime_type': 'image/png', 'data': encoded_image}, prompt])
+
+    return response.text.strip().replace(" ", "")
+
+
+# Function to process a single student's data
+def process_student(roll_no):
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    driver = webdriver.Chrome(options=options)
+
+    driver.get("https://your-college-portal.example.com/Result/ProgramSelect.aspx")
+    driver.maximize_window()
+
+    WebDriverWait(driver, 10).until(
+        EC.visibility_of_element_located((By.ID, "ContentPlaceHolder1_radlstProgram_6"))
+    ).click()
+
+    try:
+        roll_number_input = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.ID, "ContentPlaceHolder1_txtrollno"))
+        )
+        roll_number_input.clear()
+        roll_number_input.send_keys(roll_no)
+
+        dropdown = WebDriverWait(driver, 3).until(
+            EC.visibility_of_element_located((By.ID, "ContentPlaceHolder1_drpSemester"))
+        )
+        dropdown.find_element(By.XPATH, "//option[. = '5']").click()
+
+        time.sleep(3)
+
+        captcha_input = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.ID, "ContentPlaceHolder1_TextBox1"))
+        )
+        captcha_input.clear()
+
+        captcha_image = WebDriverWait(driver, 5).until(
+            EC.visibility_of_element_located((By.CSS_SELECTOR, "img[alt='Captcha']"))
+        )
+        captcha_image.screenshot("captcha.png")
+
+        while True:
+            captcha_text = solve_captcha("captcha.png")
+            captcha_input.send_keys(captcha_text)
+            time.sleep(1)
+
+            WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.ID, "ContentPlaceHolder1_btnviewresult"))
+            ).click()
+
+            try:
+                alert = WebDriverWait(driver, 2).until(EC.alert_is_present())
+                alert.accept()
+                print(f"❌ Incorrect Captcha for {roll_no}, retrying...")
+                captcha_input.clear()
+                continue
+            except:
+                print(f"✅ Captcha correct for {roll_no}, proceeding...")
+                break
+
+        def get_text(selector):
+            return WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+            ).text.strip()
+
+        student_data = {
+            "Name": get_text("#ContentPlaceHolder1_lblNameGrading"),
+            "Enrollment No.": get_text("#ContentPlaceHolder1_lblRollNoGrading"),
+            "Semester": get_text("#ContentPlaceHolder1_lblSemesterGrading"),
+            "CGPA": get_text("#ContentPlaceHolder1_lblSGPA"),
+            "Result": get_text("#ContentPlaceHolder1_lblResultNewGrading"),
+            "Branch": get_text("#ContentPlaceHolder1_lblBranchGrading")
+        }
+
+        print(student_data)
+        return student_data
+
+    except Exception as e:
+        print(f"❌ Error processing {roll_no}: {e}")
+        return None
+
+    finally:
+        driver.quit()
+
+
+# Example list of roll numbers
+enrollment_numbers = [
+    "ROLLNO001", "ROLLNO002", "ROLLNO003",
+    "ROLLNO004", "ROLLNO005", "ROLLNO006", "ROLLNO007"
+]
+
+# Retry logic per student
+def process_student_with_retries(roll_no):
+    while True:
+        result = process_student(roll_no)
+        if result is not None:
+            return result
+        else:
+            print(f"🔄 Retrying enrollment number {roll_no}...")
+
+all_results = []
+with ThreadPoolExecutor(max_workers=1) as executor:
+    future_to_roll_no = {executor.submit(process_student_with_retries, roll_no): roll_no for roll_no in enrollment_numbers}
+    
+    for future in as_completed(future_to_roll_no):
+        roll_no = future_to_roll_no[future]
+        try:
+            result = future.result()
+            all_results.append(result)
+            print(f"✅ Successfully processed {roll_no}")
+        except Exception as e:
+            print(f"❌ Error processing {roll_no}: {e}")
+
+# Save to Excel
+df = pd.DataFrame(all_results)
+excel_filename = "all_results.xlsx"
+df.to_excel(excel_filename, index=False)
+print(f"📄 All results saved in {excel_filename}")
+
+# Save to PDF
+class PDF(FPDF):
+    def header(self):
+        self.set_font("Arial", "B", 16)
+        self.cell(200, 10, "Student Results Report", ln=True, align="C")
+
+pdf = PDF()
+pdf.add_page()
+pdf.set_font("Arial", size=12)
+
+for student in all_results:
+    pdf.cell(200, 10, "-" * 40, ln=True)
+    for key, value in student.items():
+        pdf.cell(200, 10, f"{key}: {value}", ln=True)
+
+pdf_filename = "all_results.pdf"
+pdf.output(pdf_filename)
+print(f"📄 PDF saved as {pdf_filename}")
